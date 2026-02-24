@@ -27,6 +27,11 @@ except ImportError:
     )
     sys.exit(1)
 
+try:
+    import olefile
+except ImportError:
+    olefile = None
+
 
 IMAGE_EXTENSIONS = {
     ".png",
@@ -39,6 +44,8 @@ IMAGE_EXTENSIONS = {
     ".webp",
     ".heic",
 }
+
+OLE_SIGNATURE = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
 
 
 def get_attr(obj: Any, *names: str) -> Any:
@@ -250,6 +257,41 @@ def is_embedded_msg_file(path: Path | None) -> bool:
     return bool(path and path.suffix.lower() == ".msg")
 
 
+def validate_msg_container(path: Path) -> tuple[bool, str | None]:
+    if not path.exists() or not path.is_file():
+        return False, "File not found"
+
+    try:
+        with path.open("rb") as handle:
+            signature = handle.read(8)
+    except OSError as exc:
+        return False, f"Unable to read file header: {exc}"
+
+    if signature != OLE_SIGNATURE:
+        return False, "Not an OLE MSG file (invalid signature)"
+
+    if olefile is None:
+        return True, None
+
+    try:
+        if not olefile.isOleFile(str(path)):
+            return False, "Not an OLE file"
+        with olefile.OleFileIO(str(path)) as ole:
+            stream_names = {
+                "/".join(parts).lower()
+                for parts in ole.listdir(streams=True, storages=False)
+            }
+            has_properties_stream = any(
+                name.endswith("__properties_version1.0") for name in stream_names
+            )
+            if not has_properties_stream:
+                return False, "File does not contain a property stream"
+    except Exception as exc:  # noqa: BLE001
+        return False, str(exc)
+
+    return True, None
+
+
 def process_msg_file(
     msg_path: Path,
     output_dir: Path,
@@ -279,6 +321,13 @@ def process_msg_file(
         "attachments": [],
         "embedded_messages": [],
     }
+
+    is_valid_msg, invalid_reason = validate_msg_container(msg_path)
+    if not is_valid_msg:
+        result["status"] = "skipped_invalid_msg"
+        result["error"] = invalid_reason
+        logger.warning("Skipping invalid .msg file %s: %s", msg_path, invalid_reason)
+        return result
 
     try:
         msg = extract_msg.Message(str(msg_path))
@@ -316,11 +365,21 @@ def process_msg_file(
                         logger.warning("Password-protected zip detected: %s", saved_path)
 
                 if recursive and is_embedded_msg_file(saved_path):
-                    nested_base = output_dir / "embedded_messages"
-                    nested_name = sanitize_name(saved_path.stem, fallback=f"embedded_{idx}")
-                    nested_dir = unique_path(nested_base / nested_name)
-                    nested_result = process_msg_file(saved_path, nested_dir, recursive, visited, logger)
-                    result["embedded_messages"].append(nested_result)
+                    embedded_valid, embedded_reason = validate_msg_container(saved_path)
+                    if embedded_valid:
+                        nested_base = output_dir / "embedded_messages"
+                        nested_name = sanitize_name(saved_path.stem, fallback=f"embedded_{idx}")
+                        nested_dir = unique_path(nested_base / nested_name)
+                        nested_result = process_msg_file(saved_path, nested_dir, recursive, visited, logger)
+                        result["embedded_messages"].append(nested_result)
+                    else:
+                        record["embedded_msg_status"] = "skipped_invalid_msg"
+                        record["embedded_msg_reason"] = embedded_reason
+                        logger.warning(
+                            "Skipping embedded .msg attachment %s: %s",
+                            saved_path,
+                            embedded_reason,
+                        )
 
             attachment_records.append(record)
 
