@@ -276,16 +276,6 @@ def validate_msg_container(path: Path) -> tuple[bool, str | None]:
     try:
         if not olefile.isOleFile(str(path)):
             return False, "Not an OLE file"
-        with olefile.OleFileIO(str(path)) as ole:
-            stream_names = {
-                "/".join(parts).lower()
-                for parts in ole.listdir(streams=True, storages=False)
-            }
-            has_properties_stream = any(
-                name.endswith("__properties_version1.0") for name in stream_names
-            )
-            if not has_properties_stream:
-                return False, "File does not contain a property stream"
     except Exception as exc:  # noqa: BLE001
         return False, str(exc)
 
@@ -395,9 +385,15 @@ def process_msg_file(
         result["metadata_file"] = str(metadata_file)
 
     except Exception as exc:  # noqa: BLE001
-        result["status"] = "error"
-        result["error"] = str(exc)
-        logger.exception("Failed to process %s", msg_path)
+        error_text = str(exc)
+        if "property stream" in error_text.lower():
+            result["status"] = "skipped_invalid_msg"
+            result["error"] = "Unsupported .msg structure (missing property stream)"
+            logger.warning("Skipping unsupported .msg file %s: %s", msg_path, error_text)
+        else:
+            result["status"] = "error"
+            result["error"] = error_text
+            logger.exception("Failed to process %s", msg_path)
     finally:
         if msg is not None and hasattr(msg, "close"):
             try:
@@ -408,11 +404,23 @@ def process_msg_file(
     return result
 
 
-def discover_msg_files(input_path: Path) -> list[Path]:
+def discover_msg_files(input_path: Path, exclude_roots: Iterable[Path] | None = None) -> list[Path]:
+    excludes = [p.resolve() for p in (exclude_roots or [])]
+
+    def is_excluded(path: Path) -> bool:
+        candidate = path.resolve()
+        return any(candidate.is_relative_to(root) for root in excludes)
+
     if input_path.is_file():
-        return [input_path] if input_path.suffix.lower() == ".msg" else []
+        if input_path.suffix.lower() == ".msg" and not is_excluded(input_path):
+            return [input_path]
+        return []
     if input_path.is_dir():
-        return sorted(path for path in input_path.rglob("*") if path.suffix.lower() == ".msg")
+        return sorted(
+            path
+            for path in input_path.rglob("*")
+            if path.suffix.lower() == ".msg" and not is_excluded(path)
+        )
     return []
 
 
@@ -460,7 +468,7 @@ def main() -> int:
     output_root = Path(args.output).expanduser().resolve()
     output_root.mkdir(parents=True, exist_ok=True)
 
-    msg_files = discover_msg_files(input_path)
+    msg_files = discover_msg_files(input_path, exclude_roots=[output_root])
     if not msg_files:
         logger.error("No .msg files found in: %s", input_path)
         return 1
